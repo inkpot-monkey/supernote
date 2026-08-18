@@ -52,8 +52,8 @@ _DEVICE_QUERY = "EIO=3&transport=websocket&type=SN000X00000000"
 
 # The capture recorded nine consecutive unanswered `ratta_ping`s on one 240s channel.
 # Reproduce that count, which is what the channel has to survive; the device's real 25s
-# cadence is not reproduced, since the handler holds no timers of its own
-# (`heartbeat=None` on the WebSocketResponse) and so cannot be sensitive to it.
+# cadence is not reproduced, since the handler's only timer is the 85s silence bound,
+# which no round trip here comes close to.
 _OBSERVED_UNANSWERED_APP_EVENTS = 9
 
 # Stands in for the handler's 85s silence bound, which no suite can wait out.
@@ -185,8 +185,8 @@ async def test_device_disconnect_frame_draws_no_reply(
 
     await device_ws.close(code=WSCloseCode.OK)
 
-    closed = await _await_log(caplog, "channel closed")
-    assert "close_code=1000" in closed, closed
+    _, close_code, frames_in = await _await_log(caplog, "channel closed")
+    assert (close_code, frames_in) == (WSCloseCode.OK, 2)
 
 
 async def test_device_close_frame_ends_the_channel(
@@ -205,8 +205,8 @@ async def test_device_close_frame_ends_the_channel(
 
     msg = await device_ws.receive(timeout=_RECV_TIMEOUT)
     assert msg.type is WSMsgType.CLOSE, msg
-    closed = await _await_log(caplog, "channel closed")
-    assert "frames_in=1" in closed, closed
+    _, _, frames_in = await _await_log(caplog, "channel closed")
+    assert frames_in == 1
 
 
 async def test_silent_device_is_closed_once_the_ping_timeout_lapses(
@@ -245,7 +245,8 @@ async def test_silent_device_is_closed_once_the_ping_timeout_lapses(
     finally:
         await ws.close()
 
-    assert "timed out" in await _await_log(caplog, "timed out")
+    _, silent_for = await _await_log(caplog, "timed out")
+    assert silent_for == _SHORTENED_TIMEOUT_S
 
 
 @pytest.mark.parametrize(
@@ -326,9 +327,10 @@ async def test_device_frames_are_logged_for_diagnosis(
     await device_ws.send_str("2")
     assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
 
-    frames = [r.getMessage() for r in caplog.records if "frame" in r.getMessage()]
-    assert any('"2"' in m or "'2'" in m for m in frames), frames
-    assert any("ratta_ping" in m for m in frames), frames
+    # Assert the whole sequence, not the presence of a substring: the log is read to
+    # reconstruct a live channel, so the order and the exact payloads are the contract.
+    frames = [args[1] for args in _log_args(caplog, "realtime frame")]
+    assert frames == ["2", '42["ratta_ping"]', "2"], frames
 
 
 async def test_channel_close_logs_the_close_code(
@@ -346,17 +348,35 @@ async def test_channel_close_logs_the_close_code(
     assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
     await device_ws.close(code=WSCloseCode.GOING_AWAY)
 
-    closed = await _await_log(caplog, "channel closed")
-    assert "close_code=1001" in closed, closed
-    assert "frames_in=1" in closed, closed
+    _, close_code, frames_in = await _await_log(caplog, "channel closed")
+    assert (close_code, frames_in) == (WSCloseCode.GOING_AWAY, 1)
 
 
-async def _await_log(caplog: pytest.LogCaptureFixture, needle: str) -> str:
-    """Wait for a log line containing ``needle``; the handler finishes after the close."""
+def _log_args(
+    caplog: pytest.LogCaptureFixture, needle: str
+) -> list[tuple[object, ...]]:
+    """The argument tuples of every logged record whose message contains ``needle``.
+
+    The arguments rather than the rendered line: what these logs are read for is the
+    frame, the close code, the count — so assert on those, not on how they format.
+    """
+    return [
+        record.args
+        for record in caplog.records
+        if needle in record.msg and isinstance(record.args, tuple)
+    ]
+
+
+async def _await_log(
+    caplog: pytest.LogCaptureFixture, needle: str
+) -> tuple[object, ...]:
+    """Wait for the first record matching ``needle`` and return its arguments.
+
+    Polling rather than awaiting the handler directly: these lines are written as the
+    channel unwinds, after the client has already seen the close.
+    """
     for _ in range(int(_RECV_TIMEOUT / 0.05)):
-        for record in caplog.records:
-            message = record.getMessage()
-            if needle in message:
-                return message
+        if matched := _log_args(caplog, needle):
+            return matched[0]
         await asyncio.sleep(0.05)
-    raise AssertionError(f"no log line containing {needle!r}: {caplog.text}")
+    raise AssertionError(f"no log record containing {needle!r}: {caplog.text}")

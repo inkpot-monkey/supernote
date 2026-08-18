@@ -19,7 +19,7 @@ from supernote.models.socket import (
 from supernote.server.app import create_app
 from supernote.server.config import ServerConfig
 from supernote.server.services.user import JWT_ALGORITHM
-from supernote.server.socket import SocketIOServerManager
+from supernote.server.socket import SocketIOServerManager, build_async_server
 from supernote.server.socket_auth import compute_handshake_signature
 
 
@@ -249,3 +249,30 @@ async def test_socketio_client_messages_async_iterator(
         break
 
     await socket_client.disconnect()
+
+
+def test_build_async_server_rejects_unknown_options() -> None:
+    """Unknown Socket.IO options must raise rather than be silently discarded.
+
+    ``socketio.AsyncServer`` and ``engineio.AsyncServer`` both end their signatures in
+    ``**kwargs``, so a misspelled or non-existent option is forwarded from one to the
+    other and dropped with no error and no warning. That is how ``allow_eio3=True`` — an
+    option of the *JavaScript* socket.io server, which has never existed in either
+    Python library at any version — sat in this module advertising Engine.IO v3 support
+    the server did not have, for long enough that a downstream consumer retired a
+    working implementation on the strength of it.
+    """
+    with pytest.raises(TypeError, match="allow_eio3"):
+        build_async_server(allow_eio3=True)
+
+
+def test_build_async_server_accepts_supported_options() -> None:
+    """The option check must not be so strict that it rejects real options."""
+    server = build_async_server(
+        async_mode="aiohttp",
+        cors_allowed_origins="*",
+        ping_interval=25,
+        logger=False,
+        engineio_logger=False,
+    )
+    assert server.eio.ping_interval == 25

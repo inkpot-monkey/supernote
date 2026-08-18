@@ -1,9 +1,21 @@
-"""Socket.IO server manager and event handling for Supernote server."""
+"""Socket.IO server manager and event handling for Supernote server.
 
+This is the **modern** channel: ``python-socketio`` 5.x over ``python-engineio`` 4.x,
+which speak Socket.IO v5 / Engine.IO v4 and nothing older. It serves this project's own
+client (:mod:`supernote.client.socket`).
+
+Supernote *devices* are not v4 clients — they connect with ``EIO=3`` (Engine.IO v3 /
+Socket.IO v2) and are refused here at version negotiation. Their channel is served
+separately by :mod:`supernote.server.realtime`; see that module for the wire format.
+"""
+
+import inspect
 import logging
 from http import HTTPStatus
+from typing import Any
 from urllib.parse import parse_qs
 
+import engineio
 import socketio
 from aiohttp import web
 
@@ -20,6 +32,49 @@ from supernote.server.socket_auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _supported_server_options() -> frozenset[str]:
+    """Collect every option name the Socket.IO / Engine.IO server pair really accepts."""
+
+    def _params(func: Any) -> set[str]:
+        return {
+            name
+            for name, param in inspect.signature(func).parameters.items()
+            if name != "self"
+            and param.kind
+            not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+        }
+
+    return frozenset(
+        _params(socketio.AsyncServer.__init__)
+        | _params(engineio.AsyncServer.__init__)
+        # socketio pops this one and forwards it as engineio's `logger`.
+        | {"engineio_logger"}
+    )
+
+
+def build_async_server(**options: Any) -> socketio.AsyncServer:
+    """Construct an ``AsyncServer``, rejecting options neither library implements.
+
+    Both ``socketio.AsyncServer.__init__`` and ``engineio.AsyncServer.__init__`` end in
+    ``**kwargs``, and socketio forwards everything it does not recognise straight to
+    engineio, which drops the remainder on the floor. An unknown option therefore
+    produces no error, no warning, and a clean startup — the server simply does not do
+    the thing the option names.
+
+    That failure mode is not hypothetical: this module long passed ``allow_eio3=True``,
+    which is an option of the *JavaScript* socket.io server (``allowEIO3``) and has never
+    existed in either Python library. The code advertised Engine.IO v3 support that was
+    never present. Validate explicitly so a typo or a ported-from-JS option fails loudly.
+    """
+    if unknown := sorted(set(options) - _supported_server_options()):
+        raise TypeError(
+            f"unsupported Socket.IO server option(s): {', '.join(unknown)}. "
+            "Neither socketio.AsyncServer nor engineio.AsyncServer accepts these; "
+            "they would be silently ignored."
+        )
+    return socketio.AsyncServer(**options)
 
 
 def _extract_handshake_params(environ: dict) -> SocketHandshakeParams:
@@ -49,10 +104,9 @@ class SocketIOServerManager:
 
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
-        self._sio = socketio.AsyncServer(
+        self._sio = build_async_server(
             async_mode="aiohttp",
             cors_allowed_origins="*",
-            allow_eio3=True,
             logger=False,
             engineio_logger=False,
         )

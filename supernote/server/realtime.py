@@ -116,9 +116,11 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
     connected_namespaces = {"/"}
     await ws.send_str("40")
 
+    frames_in = 0
     try:
         async for msg in ws:
             if msg.type is not WSMsgType.TEXT:
+                logger.debug("device realtime frame: sid=%s <%s>", sid, msg.type.name)
                 if msg.type is WSMsgType.ERROR:
                     logger.warning(
                         "device realtime channel error sid=%s: %s", sid, ws.exception()
@@ -126,6 +128,10 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
                 break
 
             data = msg.data
+            frames_in += 1
+            # The device's side of this protocol can only be observed on hardware, so
+            # log it: this is the only record of what a real device sends and when.
+            logger.debug("device realtime frame: sid=%s %r", sid, _elide(data))
             if data[:1] == "2":  # Engine.IO PING -> PONG keepalive (v3 direction)
                 await ws.send_str("3" + data[1:])
             elif data[:1] == "4":  # Engine.IO MESSAGE -> a Socket.IO packet
@@ -133,8 +139,20 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
                 # need no reply; only a namespace CONNECT does.
                 await _reply_to_namespace_connect(ws, data[1:], connected_namespaces)
     finally:
-        logger.debug("device realtime channel closed: sid=%s", sid)
+        # The close code separates a clean client hang-up -- the device opens a fresh
+        # channel for each sync and drops the old one -- from a connection that died.
+        logger.debug(
+            "device realtime channel closed: sid=%s close_code=%s frames_in=%d",
+            sid,
+            ws.close_code,
+            frames_in,
+        )
     return ws
+
+
+def _elide(data: str, limit: int = 240) -> str:
+    """Bound a logged frame; app payloads are small but nothing guarantees it."""
+    return data if len(data) <= limit else f"{data[:limit]}...(+{len(data) - limit})"
 
 
 async def _reply_to_namespace_connect(

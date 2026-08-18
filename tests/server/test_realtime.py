@@ -22,10 +22,12 @@ implementation previously validated against real hardware (a Supernote Nomad A6 
 stock Private Cloud sync), which completed its app-data sync with no failure banners.
 """
 
+import asyncio
 import json
+import logging
 
 import pytest
-from aiohttp import WSServerHandshakeError
+from aiohttp import WSCloseCode, WSServerHandshakeError
 from aiohttp.test_utils import TestClient
 
 # Frames must arrive promptly; without a bound a missing reply hangs the suite.
@@ -152,3 +154,70 @@ async def test_device_channel_requires_websocket_transport(
     token = auth_headers["x-access-token"]
     resp = await client.get(f"/socket.io/?EIO=3&transport=polling&token={token}")
     assert resp.status == 400
+
+
+async def test_device_frames_are_logged_for_diagnosis(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every inbound frame is logged, so a live channel can be read off the journal.
+
+    The device's side of this protocol can only be observed on real hardware, and a
+    channel that logged nothing between 'open' and 'closed' left every question about
+    it — cadence, event surface, who hung up — unanswerable from a deployment.
+    """
+    caplog.set_level(logging.DEBUG, logger="supernote.server.realtime")
+    token = auth_headers["x-access-token"]
+    ws = await client.ws_connect(f"/socket.io/?{_DEVICE_QUERY}&token={token}")
+    try:
+        await ws.receive_str(timeout=_RECV_TIMEOUT)  # OPEN
+        await ws.receive_str(timeout=_RECV_TIMEOUT)  # server CONNECT
+
+        await ws.send_str("2")
+        assert await ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
+        await ws.send_str('42["ratta_ping"]')
+        # Round-trip a second ping so the app event is known to have been consumed.
+        await ws.send_str("2")
+        assert await ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
+    finally:
+        await ws.close()
+
+    frames = [r.getMessage() for r in caplog.records if "frame" in r.getMessage()]
+    assert any('"2"' in m or "'2'" in m for m in frames), frames
+    assert any("ratta_ping" in m for m in frames), frames
+
+
+async def test_channel_close_logs_the_close_code(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The close log carries the websocket close code and the inbound frame count.
+
+    Distinguishing a clean client hang-up from a dropped connection is the whole
+    question when a device reopens its channel, and only the close code answers it.
+    """
+    caplog.set_level(logging.DEBUG, logger="supernote.server.realtime")
+    token = auth_headers["x-access-token"]
+    ws = await client.ws_connect(f"/socket.io/?{_DEVICE_QUERY}&token={token}")
+    await ws.receive_str(timeout=_RECV_TIMEOUT)  # OPEN
+    await ws.receive_str(timeout=_RECV_TIMEOUT)  # server CONNECT
+    await ws.send_str("2")
+    assert await ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
+    await ws.close(code=WSCloseCode.GOING_AWAY)
+
+    closed = await _await_log(caplog, "channel closed")
+    assert "close_code=1001" in closed, closed
+    assert "frames_in=1" in closed, closed
+
+
+async def _await_log(caplog: pytest.LogCaptureFixture, needle: str) -> str:
+    """Wait for a log line containing ``needle``; the handler finishes after the close."""
+    for _ in range(int(_RECV_TIMEOUT / 0.05)):
+        for record in caplog.records:
+            message = record.getMessage()
+            if needle in message:
+                return message
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"no log line containing {needle!r}: {caplog.text}")

@@ -23,7 +23,7 @@ stock Private Cloud sync), which completed its app-data sync with no failure ban
 and the frame capture taken from that device in
 ``.scratch/realtime-frame-capture-2026-08-18.md``.
 
-Raw protocol literals (``"40"``, ``"2"``, ``"3"``) appear throughout. The style guide's
+Raw protocol literals (``"40"``, ``"2"``, ``"41"``) appear throughout. The style guide's
 "No Wire Token Leaks" rule targets callers and domain-level tests; this suite *is* the
 protocol conformance suite, and the literals are the contract under test.
 """
@@ -43,6 +43,12 @@ from supernote.server.realtime import is_device_protocol_request
 _RECV_TIMEOUT = 5.0
 
 _DEVICE_QUERY = "EIO=3&transport=websocket&type=SN000X00000000"
+
+# The capture recorded nine consecutive unanswered `ratta_ping`s on one 240s channel.
+# Reproduce that count, which is what the channel has to survive; the device's real 25s
+# cadence is not reproduced, since the handler holds no timers of its own
+# (`heartbeat=None` on the WebSocketResponse) and so cannot be sensitive to it.
+_OBSERVED_UNANSWERED_APP_EVENTS = 9
 
 
 @pytest.fixture
@@ -129,6 +135,57 @@ async def test_device_app_event_does_not_break_the_channel(
     await device_ws.send_str("2")
     assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
     assert not device_ws.closed
+
+
+async def test_channel_survives_repeated_heartbeat_cycles(
+    device_ws: ClientWebSocketResponse,
+) -> None:
+    """The channel holds across many heartbeat cycles with app events going unanswered.
+
+    This is the regression test for the churn that was once blamed on the unanswered
+    ``ratta_ping``: the device was thought to treat it as liveness and hang up when no
+    reply came. The frame capture falsified that — one 240s channel carried nine
+    consecutive unanswered ``ratta_ping``s and closed only on the device's own
+    schedule. Answering them is therefore *not* required, and this test pins the
+    property that matters: repeated cycles neither close the channel nor desynchronise
+    the pong stream.
+    """
+    for _ in range(_OBSERVED_UNANSWERED_APP_EVENTS):
+        await device_ws.send_str("2")
+        assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
+        await device_ws.send_str('42["ratta_ping"]')
+
+    assert not device_ws.closed
+    # One more round trip after the last unanswered event: the channel is still live,
+    # and the pongs still line up one-to-one with the pings rather than lagging behind.
+    await device_ws.send_str("2")
+    assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
+
+
+async def test_device_disconnect_frame_draws_no_reply(
+    device_ws: ClientWebSocketResponse,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``41`` (Socket.IO v2 DISCONNECT) is how every real channel ends, and needs no reply.
+
+    Every close in the frame capture is the device sending ``41`` and then closing the
+    websocket with code 1000 — a deliberate hang-up before its next sync, not a failure.
+    The server must not answer it (a reply to a disconnect is a protocol error) and must
+    record the close code, which is the only thing separating that clean hang-up from a
+    connection that died.
+    """
+    caplog.set_level(logging.DEBUG, logger="supernote.server.realtime")
+
+    await device_ws.send_str("41")
+    # The pong to the ping that follows is the assertion: had the DISCONNECT drawn a
+    # reply of its own, that reply — not "3" — would arrive here.
+    await device_ws.send_str("2")
+    assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
+
+    await device_ws.close(code=WSCloseCode.OK)
+
+    closed = await _await_log(caplog, "channel closed")
+    assert "close_code=1000" in closed, closed
 
 
 @pytest.mark.parametrize(

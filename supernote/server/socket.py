@@ -35,20 +35,28 @@ logger = logging.getLogger(__name__)
 
 
 def _supported_server_options() -> frozenset[str]:
-    """Collect every option name the Socket.IO / Engine.IO server pair really accepts."""
+    """Collect every option name the Socket.IO / Engine.IO server pair really accepts.
 
-    def _params(func: Any) -> set[str]:
+    Each ``__init__`` is read across the whole MRO, not just the concrete class:
+    ``socketio.AsyncServer.__init__`` re-declares only the options whose defaults it
+    changes and passes the rest up to ``socketio.base_server.BaseServer``. Reading the
+    subclass alone would reject ``serializer`` and ``always_connect``, which are real,
+    honoured options — a validator that refuses valid input is worse than none.
+    """
+
+    def _params(cls: type) -> set[str]:
         return {
             name
-            for name, param in inspect.signature(func).parameters.items()
+            for klass in cls.__mro__
+            for name, param in inspect.signature(klass.__init__).parameters.items()
             if name != "self"
             and param.kind
             not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
         }
 
     return frozenset(
-        _params(socketio.AsyncServer.__init__)
-        | _params(engineio.AsyncServer.__init__)
+        _params(socketio.AsyncServer)
+        | _params(engineio.AsyncServer)
         # socketio pops this one and forwards it as engineio's `logger`.
         | {"engineio_logger"}
     )

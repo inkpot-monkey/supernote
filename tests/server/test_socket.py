@@ -276,3 +276,20 @@ def test_build_async_server_accepts_supported_options() -> None:
         engineio_logger=False,
     )
     assert server.eio.ping_interval == 25
+
+
+def test_build_async_server_accepts_options_declared_on_a_base_class() -> None:
+    """Options inherited from ``BaseServer`` are real options and must be accepted.
+
+    ``socketio.AsyncServer.__init__`` re-declares only the parameters whose defaults it
+    changes and forwards the rest to ``socketio.base_server.BaseServer``. A check that
+    reads the concrete class alone therefore sees no ``serializer`` or ``always_connect``
+    and rejects both — turning a guard against silently-ignored options into a guard
+    that refuses valid ones.
+    """
+    server = build_async_server(
+        async_mode="aiohttp",
+        always_connect=True,
+        serializer="default",
+    )
+    assert server.always_connect is True

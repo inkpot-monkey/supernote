@@ -50,6 +50,8 @@ import secrets
 
 from aiohttp import WSMsgType, web
 
+from supernote.server.services.user import UserService
+
 logger = logging.getLogger(__name__)
 
 # Engine.IO v3 handshake timings advertised to the device (milliseconds).
@@ -84,7 +86,8 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
     token = request.query.get("token")
     if not token:
         return web.json_response({"error": "token required"}, status=401)
-    session = await request.app["user_service"].verify_token(token)
+    user_service: UserService = request.app["user_service"]
+    session = await user_service.verify_token(token)
     if not session:
         return web.json_response({"error": "invalid token"}, status=401)
 
@@ -100,7 +103,7 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
         sid,
     )
 
-    # 1) Engine.IO OPEN handshake. `upgrades` is empty: the device is already on
+    # Engine.IO OPEN handshake. `upgrades` is empty: the device is already on
     # websocket, so there is nothing to upgrade to.
     await ws.send_str(
         "0"
@@ -114,7 +117,7 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
         )
     )
 
-    # 2) Server-initiated Socket.IO v2 CONNECT for the default namespace. The device
+    # Server-initiated Socket.IO v2 CONNECT for the default namespace. The device
     # waits on this and will not proceed until it arrives.
     connected_namespaces = {"/"}
     await ws.send_str("40")

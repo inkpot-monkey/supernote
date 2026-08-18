@@ -19,15 +19,22 @@ The two protocols differ in ways that matter on the wire:
 
 These frame expectations are not read off the spec alone: they match a hand-rolled
 implementation previously validated against real hardware (a Supernote Nomad A6 X2 on
-stock Private Cloud sync), which completed its app-data sync with no failure banners.
+stock Private Cloud sync), which completed its app-data sync with no failure banners,
+and the frame capture taken from that device in
+``.scratch/realtime-frame-capture-2026-08-18.md``.
+
+Raw protocol literals (``"40"``, ``"2"``, ``"3"``) appear throughout. The style guide's
+"No Wire Token Leaks" rule targets callers and domain-level tests; this suite *is* the
+protocol conformance suite, and the literals are the contract under test.
 """
 
 import asyncio
 import json
 import logging
+from collections.abc import AsyncIterator
 
 import pytest
-from aiohttp import WSCloseCode, WSServerHandshakeError
+from aiohttp import ClientWebSocketResponse, WSCloseCode, WSServerHandshakeError
 from aiohttp.test_utils import TestClient, make_mocked_request
 
 from supernote.server.realtime import is_device_protocol_request
@@ -38,6 +45,22 @@ _RECV_TIMEOUT = 5.0
 _DEVICE_QUERY = "EIO=3&transport=websocket&type=SN000X00000000"
 
 
+@pytest.fixture
+async def device_ws(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> AsyncIterator[ClientWebSocketResponse]:
+    """A device channel past the handshake, with OPEN and the server CONNECT consumed."""
+    token = auth_headers["x-access-token"]
+    ws = await client.ws_connect(f"/socket.io/?{_DEVICE_QUERY}&token={token}")
+    await ws.receive_str(timeout=_RECV_TIMEOUT)  # Engine.IO OPEN
+    await ws.receive_str(timeout=_RECV_TIMEOUT)  # server-initiated Socket.IO CONNECT
+    try:
+        yield ws
+    finally:
+        await ws.close()
+
+
 async def test_device_handshake_sends_open_then_server_initiated_connect(
     client: TestClient,
     auth_headers: dict[str, str],
@@ -46,6 +69,9 @@ async def test_device_handshake_sends_open_then_server_initiated_connect(
 
     The device will not proceed until the server initiates the default-namespace
     CONNECT, so ``40`` must be sent without the device asking for it.
+
+    This test opens its own channel rather than taking the ``device_ws`` fixture: the
+    two frames the fixture consumes are the ones under test here.
     """
     token = auth_headers["x-access-token"]
     ws = await client.ws_connect(f"/socket.io/?{_DEVICE_QUERY}&token={token}")
@@ -55,11 +81,16 @@ async def test_device_handshake_sends_open_then_server_initiated_connect(
             f"expected Engine.IO OPEN, got {open_frame!r}"
         )
         payload = json.loads(open_frame[1:])
-        assert payload["sid"]
-        # The device is already on websocket; advertising upgrades would be a lie.
-        assert payload["upgrades"] == []
-        assert payload["pingInterval"] == 25000
-        assert payload["pingTimeout"] == 60000
+        # The sid is random per channel, so it is checked for presence and removed;
+        # everything the device negotiates against is then asserted whole.
+        assert payload.pop("sid")
+        # `upgrades` is empty because the device is already on websocket; advertising
+        # an upgrade would be a lie. The timings are what the device paces its ping by.
+        assert payload == {
+            "upgrades": [],
+            "pingInterval": 25000,
+            "pingTimeout": 60000,
+        }
 
         assert await ws.receive_str(timeout=_RECV_TIMEOUT) == "40"
     finally:
@@ -67,64 +98,37 @@ async def test_device_handshake_sends_open_then_server_initiated_connect(
 
 
 async def test_device_client_ping_is_answered_with_pong(
-    client: TestClient,
-    auth_headers: dict[str, str],
+    device_ws: ClientWebSocketResponse,
 ) -> None:
     """Engine.IO v3 reverses the heartbeat: the client pings and the server must pong.
 
     Under the v4 server this frame is an unknown packet and the connection is torn
     down, so the device's keepalive never completes.
     """
-    token = auth_headers["x-access-token"]
-    ws = await client.ws_connect(f"/socket.io/?{_DEVICE_QUERY}&token={token}")
-    try:
-        await ws.receive_str(timeout=_RECV_TIMEOUT)  # OPEN
-        await ws.receive_str(timeout=_RECV_TIMEOUT)  # server CONNECT
-
-        await ws.send_str("2")
-        assert await ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
-    finally:
-        await ws.close()
+    await device_ws.send_str("2")
+    assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
 
 
 async def test_device_client_namespace_connect_is_echoed(
-    client: TestClient,
-    auth_headers: dict[str, str],
+    device_ws: ClientWebSocketResponse,
 ) -> None:
     """A client-initiated namespace CONNECT is echoed so the client fires 'connect'."""
-    token = auth_headers["x-access-token"]
-    ws = await client.ws_connect(f"/socket.io/?{_DEVICE_QUERY}&token={token}")
-    try:
-        await ws.receive_str(timeout=_RECV_TIMEOUT)  # OPEN
-        await ws.receive_str(timeout=_RECV_TIMEOUT)  # server CONNECT
-
-        await ws.send_str("40/device,")
-        assert await ws.receive_str(timeout=_RECV_TIMEOUT) == "40/device,"
-    finally:
-        await ws.close()
+    await device_ws.send_str("40/device,")
+    assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "40/device,"
 
 
 async def test_device_app_event_does_not_break_the_channel(
-    client: TestClient,
-    auth_headers: dict[str, str],
+    device_ws: ClientWebSocketResponse,
 ) -> None:
     """An app-level event (the device's 'ratta_ping') leaves the channel usable.
 
     The device needs no server reply to its app events — only that the channel stays
     connected — so the keepalive must still work afterwards.
     """
-    token = auth_headers["x-access-token"]
-    ws = await client.ws_connect(f"/socket.io/?{_DEVICE_QUERY}&token={token}")
-    try:
-        await ws.receive_str(timeout=_RECV_TIMEOUT)  # OPEN
-        await ws.receive_str(timeout=_RECV_TIMEOUT)  # server CONNECT
-
-        await ws.send_str('42["ratta_ping","{}"]')
-        await ws.send_str("2")
-        assert await ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
-        assert not ws.closed
-    finally:
-        await ws.close()
+    await device_ws.send_str('42["ratta_ping","{}"]')
+    await device_ws.send_str("2")
+    assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
+    assert not device_ws.closed
 
 
 @pytest.mark.parametrize(
@@ -187,8 +191,7 @@ async def test_device_channel_requires_websocket_transport(
 
 
 async def test_device_frames_are_logged_for_diagnosis(
-    client: TestClient,
-    auth_headers: dict[str, str],
+    device_ws: ClientWebSocketResponse,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Every inbound frame is logged, so a live channel can be read off the journal.
@@ -198,20 +201,13 @@ async def test_device_frames_are_logged_for_diagnosis(
     it — cadence, event surface, who hung up — unanswerable from a deployment.
     """
     caplog.set_level(logging.DEBUG, logger="supernote.server.realtime")
-    token = auth_headers["x-access-token"]
-    ws = await client.ws_connect(f"/socket.io/?{_DEVICE_QUERY}&token={token}")
-    try:
-        await ws.receive_str(timeout=_RECV_TIMEOUT)  # OPEN
-        await ws.receive_str(timeout=_RECV_TIMEOUT)  # server CONNECT
 
-        await ws.send_str("2")
-        assert await ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
-        await ws.send_str('42["ratta_ping"]')
-        # Round-trip a second ping so the app event is known to have been consumed.
-        await ws.send_str("2")
-        assert await ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
-    finally:
-        await ws.close()
+    await device_ws.send_str("2")
+    assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
+    await device_ws.send_str('42["ratta_ping"]')
+    # Round-trip a second ping so the app event is known to have been consumed.
+    await device_ws.send_str("2")
+    assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
 
     frames = [r.getMessage() for r in caplog.records if "frame" in r.getMessage()]
     assert any('"2"' in m or "'2'" in m for m in frames), frames
@@ -219,8 +215,7 @@ async def test_device_frames_are_logged_for_diagnosis(
 
 
 async def test_channel_close_logs_the_close_code(
-    client: TestClient,
-    auth_headers: dict[str, str],
+    device_ws: ClientWebSocketResponse,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The close log carries the websocket close code and the inbound frame count.
@@ -229,13 +224,10 @@ async def test_channel_close_logs_the_close_code(
     question when a device reopens its channel, and only the close code answers it.
     """
     caplog.set_level(logging.DEBUG, logger="supernote.server.realtime")
-    token = auth_headers["x-access-token"]
-    ws = await client.ws_connect(f"/socket.io/?{_DEVICE_QUERY}&token={token}")
-    await ws.receive_str(timeout=_RECV_TIMEOUT)  # OPEN
-    await ws.receive_str(timeout=_RECV_TIMEOUT)  # server CONNECT
-    await ws.send_str("2")
-    assert await ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
-    await ws.close(code=WSCloseCode.GOING_AWAY)
+
+    await device_ws.send_str("2")
+    assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
+    await device_ws.close(code=WSCloseCode.GOING_AWAY)
 
     closed = await _await_log(caplog, "channel closed")
     assert "close_code=1001" in closed, closed

@@ -48,7 +48,7 @@ import json
 import logging
 import secrets
 
-from aiohttp import WSMsgType, web
+from aiohttp import WSCloseCode, WSMsgType, web
 
 from supernote.server.services.user import UserService
 
@@ -57,6 +57,12 @@ logger = logging.getLogger(__name__)
 # Engine.IO v3 handshake timings advertised to the device (milliseconds).
 _PING_INTERVAL_MS = 25000
 _PING_TIMEOUT_MS = 60000
+
+#: Longest silence tolerated before the device is presumed gone. Engine.IO v3 servers
+#: declare a client dead once ``pingInterval + pingTimeout`` passes with nothing
+#: received, so the handshake's advertised timings set this rather than a value of
+#: their own.
+_RECEIVE_TIMEOUT_S = (_PING_INTERVAL_MS + _PING_TIMEOUT_MS) / 1000
 
 #: Query-parameter value identifying an Engine.IO v3 client.
 ENGINEIO_V3 = "3"
@@ -91,7 +97,12 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
     if not session:
         return web.json_response({"error": "invalid token"}, status=401)
 
-    ws = web.WebSocketResponse(heartbeat=None)
+    # `heartbeat=None` because the device drives the keepalive itself; `receive_timeout`
+    # because nothing else would. A device that vanishes without a TCP close -- the
+    # normal end of a mobile connection -- would otherwise hold this handler and its
+    # socket for as long as the process lives, while the handshake below advertises a
+    # timeout the server never applies.
+    ws = web.WebSocketResponse(heartbeat=None, receive_timeout=_RECEIVE_TIMEOUT_S)
     await ws.prepare(request)
 
     sid = secrets.token_hex(12)
@@ -140,10 +151,22 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
             logger.debug("device realtime frame: sid=%s %r", sid, _elide(data))
             if data[:1] == "2":  # Engine.IO PING -> PONG keepalive (v3 direction)
                 await ws.send_str("3" + data[1:])
+            elif data[:1] == "1":
+                # The client is tearing the transport down; stop reading rather than
+                # wait out `receive_timeout` for a socket that is already finished.
+                break
             elif data[:1] == "4":  # Engine.IO MESSAGE -> a Socket.IO packet
                 # Application events (the device's `ratta_ping` heartbeat among them)
                 # need no reply; only a namespace CONNECT does.
                 await _reply_to_namespace_connect(ws, data[1:], connected_namespaces)
+    except TimeoutError:
+        # Nothing for `pingInterval + pingTimeout`: the device is gone without saying so.
+        logger.info(
+            "device realtime channel timed out: sid=%s after %.0fs silent",
+            sid,
+            _RECEIVE_TIMEOUT_S,
+        )
+        await ws.close(code=WSCloseCode.GOING_AWAY)
     finally:
         # The close code separates a clean client hang-up -- the device opens a fresh
         # channel for each sync and drops the old one -- from a connection that died.

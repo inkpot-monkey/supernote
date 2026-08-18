@@ -34,9 +34,15 @@ import logging
 from collections.abc import AsyncIterator
 
 import pytest
-from aiohttp import ClientWebSocketResponse, WSCloseCode, WSServerHandshakeError
+from aiohttp import (
+    ClientWebSocketResponse,
+    WSCloseCode,
+    WSMsgType,
+    WSServerHandshakeError,
+)
 from aiohttp.test_utils import TestClient, make_mocked_request
 
+from supernote.server import realtime
 from supernote.server.realtime import is_device_protocol_request
 
 # Frames must arrive promptly; without a bound a missing reply hangs the suite.
@@ -49,6 +55,9 @@ _DEVICE_QUERY = "EIO=3&transport=websocket&type=SN000X00000000"
 # cadence is not reproduced, since the handler holds no timers of its own
 # (`heartbeat=None` on the WebSocketResponse) and so cannot be sensitive to it.
 _OBSERVED_UNANSWERED_APP_EVENTS = 9
+
+# Stands in for the handler's 85s silence bound, which no suite can wait out.
+_SHORTENED_TIMEOUT_S = 0.2
 
 
 @pytest.fixture
@@ -186,6 +195,65 @@ async def test_device_disconnect_frame_draws_no_reply(
 
     closed = await _await_log(caplog, "channel closed")
     assert "close_code=1000" in closed, closed
+
+
+async def test_device_close_frame_ends_the_channel(
+    device_ws: ClientWebSocketResponse,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``1`` (Engine.IO CLOSE) tears the transport down rather than being ignored.
+
+    An ignored CLOSE is not fatal — the device drops the TCP connection immediately
+    afterwards — but it leaves the handler blocked on a socket the client has already
+    finished with until the silence bound lapses. Honouring it closes at once.
+    """
+    caplog.set_level(logging.DEBUG, logger="supernote.server.realtime")
+
+    await device_ws.send_str("1")
+
+    msg = await device_ws.receive(timeout=_RECV_TIMEOUT)
+    assert msg.type is WSMsgType.CLOSE, msg
+    closed = await _await_log(caplog, "channel closed")
+    assert "frames_in=1" in closed, closed
+
+
+async def test_silent_device_is_closed_once_the_ping_timeout_lapses(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A device that stops speaking is hung up on, not held open indefinitely.
+
+    The handshake advertises ``pingTimeout``, and a v3 server is expected to enforce it
+    at ``pingInterval + pingTimeout``. Nothing in the frame capture exercises this — every
+    channel there ended in a clean ``41`` and a 1000 close — but a device that vanishes
+    without a TCP close is the ordinary end of a mobile connection, and each one that did
+    would hold a handler and a socket for the life of the process.
+
+    The real bound is 85s, which no suite can wait out, so it is shortened here; what is
+    under test is that a bound exists and that lapsing it closes the channel.
+    """
+    caplog.set_level(logging.DEBUG, logger="supernote.server.realtime")
+    monkeypatch.setattr(realtime, "_RECEIVE_TIMEOUT_S", _SHORTENED_TIMEOUT_S)
+
+    token = auth_headers["x-access-token"]
+    ws = await client.ws_connect(f"/socket.io/?{_DEVICE_QUERY}&token={token}")
+    try:
+        await ws.receive_str(timeout=_RECV_TIMEOUT)  # Engine.IO OPEN
+        await ws.receive_str(
+            timeout=_RECV_TIMEOUT
+        )  # server-initiated Socket.IO CONNECT
+
+        # Say nothing at all: no ping, no close frame — exactly what a device that has
+        # dropped off the network looks like from here.
+        msg = await ws.receive(timeout=_RECV_TIMEOUT)
+        assert msg.type is WSMsgType.CLOSE, msg
+        assert msg.data == WSCloseCode.GOING_AWAY
+    finally:
+        await ws.close()
+
+    assert "timed out" in await _await_log(caplog, "timed out")
 
 
 @pytest.mark.parametrize(

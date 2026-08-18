@@ -184,6 +184,13 @@ async def socketio_protocol_dispatch_middleware(
     ``EIO=4`` — which this middleware used to do — only moves the failure: the v4 server
     accepts the handshake and then cannot parse the v2 CONNECT or the reversed v3
     heartbeat, so the device never establishes a session.
+
+    This is registered as the outermost middleware, so a dispatched device request is
+    neither counted by :func:`metrics_middleware` nor recorded by
+    :func:`trace_middleware`. That is deliberate: the request is a websocket that lives
+    for the whole channel — 30s to 240s in the field — and folding those durations into
+    the HTTP request histogram would describe latency the API never had. Device channels
+    are observable through :mod:`supernote.server.realtime`'s own open/frame/close log.
     """
     if is_device_protocol_request(request):
         return await handle_device_socket(request)

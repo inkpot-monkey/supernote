@@ -62,8 +62,11 @@ ENGINEIO_V3 = "3"
 
 def is_device_protocol_request(request: web.Request) -> bool:
     """Whether this request speaks Engine.IO v3 and belongs to the device channel."""
+    # Match the endpoint itself rather than a prefix: this predicate hands the request
+    # to a different protocol stack, so a near-miss path like `/socket.iox` must not
+    # qualify. python-socketio mounts at `/socket.io/`; the device omits no slash.
     return (
-        request.path.startswith("/socket.io")
+        request.path.rstrip("/") == "/socket.io"
         and request.query.get("EIO") == ENGINEIO_V3
     )
 

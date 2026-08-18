@@ -28,7 +28,9 @@ import logging
 
 import pytest
 from aiohttp import WSCloseCode, WSServerHandshakeError
-from aiohttp.test_utils import TestClient
+from aiohttp.test_utils import TestClient, make_mocked_request
+
+from supernote.server.realtime import is_device_protocol_request
 
 # Frames must arrive promptly; without a bound a missing reply hangs the suite.
 _RECV_TIMEOUT = 5.0
@@ -123,6 +125,34 @@ async def test_device_app_event_does_not_break_the_channel(
         assert not ws.closed
     finally:
         await ws.close()
+
+
+@pytest.mark.parametrize(
+    ("path", "query", "is_device"),
+    [
+        ("/socket.io/", "EIO=3&transport=websocket", True),
+        ("/socket.io", "EIO=3&transport=websocket", True),
+        # The modern client declares EIO=4 and belongs to python-socketio.
+        ("/socket.io/", "EIO=4&transport=websocket", False),
+        ("/socket.io/", "transport=websocket", False),
+        # A near-miss path must not be handed to an entirely different protocol stack.
+        ("/socket.iox", "EIO=3&transport=websocket", False),
+        ("/socket.io.bak", "EIO=3&transport=websocket", False),
+    ],
+)
+def test_device_protocol_request_matches_only_the_socketio_endpoint(
+    path: str,
+    query: str,
+    is_device: bool,
+) -> None:
+    """Dispatch is on the endpoint and the declared version, not on a path prefix.
+
+    This predicate decides which of two incompatible protocol implementations serves a
+    request, so a prefix match is too loose: it would route paths that merely start with
+    ``/socket.io`` into the legacy handler.
+    """
+    request = make_mocked_request("GET", f"{path}?{query}")
+    assert is_device_protocol_request(request) is is_device
 
 
 async def test_device_channel_rejects_missing_token(client: TestClient) -> None:

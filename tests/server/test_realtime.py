@@ -43,7 +43,7 @@ from aiohttp import (
 from aiohttp.test_utils import TestClient, make_mocked_request
 
 from supernote.server import realtime
-from supernote.server.realtime import is_device_protocol_request
+from supernote.server.realtime import is_device_channel_request
 
 # Frames must arrive promptly; without a bound a missing reply hangs the suite.
 _RECV_TIMEOUT = 5.0
@@ -261,7 +261,7 @@ async def test_silent_device_is_closed_once_the_ping_timeout_lapses(
         ("/socket.io.bak", "EIO=3&transport=websocket", False),
     ],
 )
-def test_device_protocol_request_matches_only_the_socketio_endpoint(
+def test_device_channel_request_matches_only_the_socketio_endpoint(
     path: str,
     query: str,
     is_device: bool,
@@ -273,7 +273,7 @@ def test_device_protocol_request_matches_only_the_socketio_endpoint(
     ``/socket.io`` into the legacy handler.
     """
     request = make_mocked_request("GET", f"{path}?{query}")
-    assert is_device_protocol_request(request) is is_device
+    assert is_device_channel_request(request) is is_device
 
 
 async def test_device_channel_rejects_missing_token(client: TestClient) -> None:

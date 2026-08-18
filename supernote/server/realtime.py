@@ -20,7 +20,6 @@ server is left untouched.
 Wire format (text frames over the single websocket)::
 
     packet = <engineio_type><payload>
-    engine.io types : 0 open  1 close  2 ping  3 pong  4 message  5 upgrade  6 noop
     a Socket.IO packet rides inside an Engine.IO MESSAGE(4):
         socket.io types : 0 CONNECT  1 DISCONNECT  2 EVENT  3 ACK  4 ERROR ...
     so on the wire:
@@ -47,12 +46,34 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+from enum import StrEnum
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
 from supernote.server.services.user import UserService
 
 logger = logging.getLogger(__name__)
+
+
+class EngineIO(StrEnum):
+    """Engine.IO packet type: the first character of every frame."""
+
+    OPEN = "0"
+    CLOSE = "1"
+    PING = "2"
+    PONG = "3"
+    MESSAGE = "4"
+    UPGRADE = "5"
+    NOOP = "6"
+
+
+#: Query-parameter value identifying an Engine.IO v3 client.
+ENGINEIO_V3_VERSION = "3"
+
+#: Socket.IO v2 CONNECT (packet type ``0``) for the default namespace, inside an
+#: Engine.IO MESSAGE. Named because ``EngineIO.MESSAGE`` and the Socket.IO type share a
+#: frame and neither digit means anything on its own.
+_DEFAULT_NAMESPACE_CONNECT = f"{EngineIO.MESSAGE}0"
 
 # Engine.IO v3 handshake timings advertised to the device (milliseconds).
 _PING_INTERVAL_MS = 25000
@@ -64,18 +85,18 @@ _PING_TIMEOUT_MS = 60000
 #: their own.
 _RECEIVE_TIMEOUT_S = (_PING_INTERVAL_MS + _PING_TIMEOUT_MS) / 1000
 
-#: Query-parameter value identifying an Engine.IO v3 client.
-ENGINEIO_V3 = "3"
+#: Frame payloads are small in practice, but nothing on the wire guarantees it.
+_LOGGED_FRAME_LIMIT = 240
 
 
-def is_device_protocol_request(request: web.Request) -> bool:
+def is_device_channel_request(request: web.Request) -> bool:
     """Whether this request speaks Engine.IO v3 and belongs to the device channel."""
     # Match the endpoint itself rather than a prefix: this predicate hands the request
     # to a different protocol stack, so a near-miss path like `/socket.iox` must not
     # qualify. python-socketio mounts at `/socket.io/`; the device omits no slash.
     return (
-        request.path.rstrip("/") == "/socket.io"
-        and request.query.get("EIO") == ENGINEIO_V3
+        request.path in ("/socket.io", "/socket.io/")
+        and request.query.get("EIO") == ENGINEIO_V3_VERSION
     )
 
 
@@ -106,18 +127,23 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
     await ws.prepare(request)
 
     sid = secrets.token_hex(12)
-    device = request.query.get("type")
     logger.info(
         "device realtime channel open: user=%s device=%s sid=%s",
         session.email,
-        device,
+        request.query.get("type"),
         sid,
     )
+    await _send_handshake(ws, sid)
+    await _serve_channel(ws, sid)
+    return ws
 
-    # Engine.IO OPEN handshake. `upgrades` is empty: the device is already on
-    # websocket, so there is nothing to upgrade to.
+
+async def _send_handshake(ws: web.WebSocketResponse, sid: str) -> None:
+    """Open the Engine.IO session, then initiate the CONNECT the device waits on."""
+    # `upgrades` is empty: the device is already on websocket, so there is nothing to
+    # upgrade to. The timings are what the device paces its own ping by.
     await ws.send_str(
-        "0"
+        EngineIO.OPEN
         + json.dumps(
             {
                 "sid": sid,
@@ -127,11 +153,13 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
             }
         )
     )
+    # Socket.IO v2 has the server initiate the default-namespace CONNECT, unprompted.
+    # The device will not proceed until it arrives.
+    await ws.send_str(_DEFAULT_NAMESPACE_CONNECT)
 
-    # Server-initiated Socket.IO v2 CONNECT for the default namespace. The device
-    # waits on this and will not proceed until it arrives.
-    await ws.send_str("40")
 
+async def _serve_channel(ws: web.WebSocketResponse, sid: str) -> None:
+    """Answer the device's keepalive until the channel ends, logging what crossed it."""
     frames_in = 0
     try:
         async for msg in ws:
@@ -148,9 +176,10 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
             # The device's side of this protocol can only be observed on hardware, so
             # log it: this is the only record of what a real device sends and when.
             logger.debug("device realtime frame: sid=%s %r", sid, _elide(data))
-            if data[:1] == "2":  # Engine.IO PING -> PONG keepalive (v3 direction)
-                await ws.send_str("3" + data[1:])
-            elif data[:1] == "1":
+            if data[:1] == EngineIO.PING:
+                # Engine.IO v3 keepalive, client-driven: echo the payload back as PONG.
+                await ws.send_str(EngineIO.PONG + data[1:])
+            elif data[:1] == EngineIO.CLOSE:
                 # The client is tearing the transport down; stop reading rather than
                 # wait out `receive_timeout` for a socket that is already finished.
                 break
@@ -174,9 +203,10 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
             ws.close_code,
             frames_in,
         )
-    return ws
 
 
-def _elide(data: str, limit: int = 240) -> str:
-    """Bound a logged frame; app payloads are small but nothing guarantees it."""
-    return data if len(data) <= limit else f"{data[:limit]}...(+{len(data) - limit})"
+def _elide(data: str) -> str:
+    """Bound a logged frame to ``_LOGGED_FRAME_LIMIT``, noting what was dropped."""
+    if len(data) <= _LOGGED_FRAME_LIMIT:
+        return data
+    return f"{data[:_LOGGED_FRAME_LIMIT]}...(+{len(data) - _LOGGED_FRAME_LIMIT})"

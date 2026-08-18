@@ -27,7 +27,7 @@ from .db.models.user import UserDO
 from .db.session import DatabaseSessionManager
 from .events import LocalEventBus
 from .metrics import HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL
-from .realtime import handle_device_socket, is_device_protocol_request
+from .realtime import handle_device_socket, is_device_channel_request
 from .routes import (
     admin,
     auth,
@@ -192,7 +192,7 @@ async def socketio_protocol_dispatch_middleware(
     the HTTP request histogram would describe latency the API never had. Device channels
     are observable through :mod:`supernote.server.realtime`'s own open/frame/close log.
     """
-    if is_device_protocol_request(request):
+    if is_device_channel_request(request):
         return await handle_device_socket(request)
     return await handler(request)
 

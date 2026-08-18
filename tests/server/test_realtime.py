@@ -124,14 +124,6 @@ async def test_device_client_ping_is_answered_with_pong(
     assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "3"
 
 
-async def test_device_client_namespace_connect_is_echoed(
-    device_ws: ClientWebSocketResponse,
-) -> None:
-    """A client-initiated namespace CONNECT is echoed so the client fires 'connect'."""
-    await device_ws.send_str("40/device,")
-    assert await device_ws.receive_str(timeout=_RECV_TIMEOUT) == "40/device,"
-
-
 async def test_device_app_event_does_not_break_the_channel(
     device_ws: ClientWebSocketResponse,
 ) -> None:

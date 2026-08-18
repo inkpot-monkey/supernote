@@ -130,7 +130,6 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
 
     # Server-initiated Socket.IO v2 CONNECT for the default namespace. The device
     # waits on this and will not proceed until it arrives.
-    connected_namespaces = {"/"}
     await ws.send_str("40")
 
     frames_in = 0
@@ -155,10 +154,9 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
                 # The client is tearing the transport down; stop reading rather than
                 # wait out `receive_timeout` for a socket that is already finished.
                 break
-            elif data[:1] == "4":  # Engine.IO MESSAGE -> a Socket.IO packet
-                # Application events (the device's `ratta_ping` heartbeat among them)
-                # need no reply; only a namespace CONNECT does.
-                await _reply_to_namespace_connect(ws, data[1:], connected_namespaces)
+            # Everything else is a Socket.IO packet inside an Engine.IO MESSAGE -- the
+            # device's `ratta_ping` event and its closing DISCONNECT among them. None
+            # of them takes a reply; the device needs only that the channel stays up.
     except TimeoutError:
         # Nothing for `pingInterval + pingTimeout`: the device is gone without saying so.
         logger.info(
@@ -182,24 +180,3 @@ async def handle_device_socket(request: web.Request) -> web.StreamResponse:
 def _elide(data: str, limit: int = 240) -> str:
     """Bound a logged frame; app payloads are small but nothing guarantees it."""
     return data if len(data) <= limit else f"{data[:limit]}...(+{len(data) - limit})"
-
-
-async def _reply_to_namespace_connect(
-    ws: web.WebSocketResponse, sio_packet: str, connected_namespaces: set[str]
-) -> None:
-    """Echo a namespace CONNECT (``40[/nsp,]``) so the client fires its 'connect' event.
-
-    ``sio_packet`` is everything after the Engine.IO ``4``. Only a Socket.IO CONNECT
-    (type ``0``) is acted on; every other packet type is ignored.
-    """
-    if sio_packet[:1] != "0":
-        return
-    rest = sio_packet[1:]
-    namespace = "/"
-    if rest.startswith("/"):
-        comma = rest.find(",")
-        namespace = rest if comma == -1 else rest[:comma]
-    if namespace in connected_namespaces:
-        return
-    connected_namespaces.add(namespace)
-    await ws.send_str("40" if namespace == "/" else f"40{namespace},")

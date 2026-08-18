@@ -27,6 +27,7 @@ from .db.models.user import UserDO
 from .db.session import DatabaseSessionManager
 from .events import LocalEventBus
 from .metrics import HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL
+from .realtime import handle_device_socket, is_device_protocol_request
 from .routes import (
     admin,
     auth,
@@ -166,15 +167,26 @@ async def trace_middleware(
 
 
 @web.middleware
-async def socketio_compat_middleware(
+async def socketio_protocol_dispatch_middleware(
     request: web.Request,
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
 ) -> web.StreamResponse:
-    """Rewrite Socket.IO requests query parameters from EIO=3 (Engine.IO v3) to EIO=4 for protocol compatibility."""
-    if request.path.startswith("/socket.io/") and request.query.get("EIO") == "3":
-        new_query = dict(request.query)
-        new_query["EIO"] = "4"
-        request = request.clone(rel_url=request.rel_url.with_query(new_query))
+    """Route Socket.IO requests to the server that speaks the client's protocol version.
+
+    Two incompatible protocol generations share the ``/socket.io/`` path:
+
+    * Supernote **devices** connect with ``EIO=3`` (Engine.IO v3 / Socket.IO v2) and are
+      served by :mod:`supernote.server.realtime`.
+    * This project's own client connects with ``EIO=4`` (Socket.IO v5) and is served by
+      ``python-socketio`` via :mod:`supernote.server.socket`.
+
+    Dispatching on the declared version keeps each stack whole. Rewriting ``EIO=3`` to
+    ``EIO=4`` — which this middleware used to do — only moves the failure: the v4 server
+    accepts the handshake and then cannot parse the v2 CONNECT or the reversed v3
+    heartbeat, so the device never establishes a session.
+    """
+    if is_device_protocol_request(request):
+        return await handle_device_socket(request)
     return await handler(request)
 
 
@@ -448,7 +460,7 @@ def create_app(config: ServerConfig) -> web.Application:
             await aiohttp_remotes.setup(app, aiohttp_remotes.XForwardedRelaxed())
 
         # Register trace and auth middlewares after proxy setup to avoid clone errors
-        app.middlewares.append(socketio_compat_middleware)
+        app.middlewares.append(socketio_protocol_dispatch_middleware)
         if config.metrics_enabled:
             app.middlewares.append(metrics_middleware)
         app.middlewares.append(trace_middleware)
